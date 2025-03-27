@@ -1,69 +1,103 @@
-import pathlib
-import os
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, HTTPException, File, UploadFile
 from fastapi.responses import JSONResponse
-from google.genai import types
-from dotenv import load_dotenv
-import httpx
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import google.generativeai as genai
+import os
+from typing import Dict
+from io import BytesIO
+from PyPDF2 import PdfReader
+from docx import Document
 
-# Load environment variables from .env file
-load_dotenv()
-
-# Initialize FastAPI app
 app = FastAPI()
 
-# Retrieve the API key from the environment
-API_KEY = os.getenv("GENAI_API_KEY")
+# Configure CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # In production, replace with your frontend URL
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# Check if API_KEY is available
-if not API_KEY:
-    raise ValueError("API_KEY is missing. Please make sure to set it in the .env file.")
+# Configure Google AI
+genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+model = genai.GenerativeModel('gemini-2.0-flash')
 
-# Endpoint to handle PDF file upload and summarization
-@app.post("/summarize-pdf/")
-async def summarize_pdf(file: UploadFile = File(...)):
+class ChatMessage(BaseModel):
+    message: str
+
+class HealthData(BaseModel):
+    bloodPressure: str
+    bloodSugar: str
+    cholesterol: str
+    heartRate: str
+    temperature: str
+
+@app.get("/")
+@app.head("/")
+async def read_root():
+    return {"message": "API is working!"}
+
+# Handling OPTIONS request explicitly for CORS pre-flight
+@app.options("/api/chat/") 
+async def handle_options_chat():
+    return JSONResponse(content={}, status_code=200)
+
+@app.options("/api/predict/") 
+async def handle_options_predict():
+    return JSONResponse(content={}, status_code=200)
+
+# Extract text from PDF
+def extract_text_from_pdf(pdf_file: BytesIO) -> str:
+    pdf_reader = PdfReader(pdf_file)
+    text = ""
+    for page in pdf_reader.pages:
+        text += page.extract_text()
+    return text
+
+# Extract text from DOCX
+def extract_text_from_docx(docx_file: BytesIO) -> str:
+    doc = Document(docx_file)
+    text = ""
+    for para in doc.paragraphs:
+        text += para.text + "\n"
+    return text
+
+# Extract text from TXT
+def extract_text_from_txt(txt_file: BytesIO) -> str:
+    return txt_file.read().decode("utf-8")
+
+# Endpoint to process medical document
+@app.post("/api/process_document")
+async def process_document(file: UploadFile = File(...)) -> Dict[str, str]:
+    # Read the uploaded file
     try:
-        # Save uploaded PDF content temporarily
-        pdf_content = await file.read()
+        content = await file.read()
+        file_extension = file.filename.split(".")[-1].lower()
 
-        # Optionally, save to a local file (for logging purposes or other needs)
-        temp_file_path = pathlib.Path("temp_uploaded_pdf.pdf")
-        temp_file_path.write_bytes(pdf_content)
+        # Extract text based on file type
+        if file_extension == "pdf":
+            text = extract_text_from_pdf(BytesIO(content))
+        elif file_extension == "docx":
+            text = extract_text_from_docx(BytesIO(content))
+        elif file_extension == "txt":
+            text = extract_text_from_txt(BytesIO(content))
+        else:
+            raise HTTPException(status_code=400, detail="Unsupported file format. Only PDF, DOCX, and TXT are allowed.")
 
-        # Prompt for summarization (you can adjust the prompt as needed)
-        prompt = "Summarize this document"
+        # Use the extracted text to generate a response using Google AI
+        prompt = f"""
+        You are a medical AI assistant. Analyze the following medical document and provide a summary:
+        {text}
+        Always include a disclaimer that this is not professional medical advice.
+        """
 
-        # Create an HTTPX client to send a request to Google GenAI API
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                "https://genai.googleapis.com/v1/models/gemini-1.5-flash:generateContent",
-                json={
-                    "model": "gemini-1.5-flash",  # Replace with your desired model
-                    "contents": [
-                        {
-                            "data": pdf_content,
-                            "mime_type": "application/pdf",
-                        },
-                        prompt,
-                    ],
-                },
-                headers={"Authorization": f"Bearer {API_KEY}"},
-            )
+        try:
+            response = model.generate_content(prompt)
+            return {"summary": response.text}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Error in processing the request: {str(e)}")
 
-            # Check if the response was successful
-            if response.status_code != 200:
-                raise HTTPException(status_code=response.status_code, detail="Failed to summarize PDF.")
-
-            # Extract the summarized content from the response
-            summary = response.json().get("text", "")
-
-            # Return the summarized text as a JSON response
-            return JSONResponse(content={"summary": summary})
-
-    except httpx.HTTPStatusError as http_error:
-        # Return HTTP error message
-        raise HTTPException(status_code=http_error.response.status_code, detail=str(http_error))
     except Exception as e:
-        # Handle any other unexpected errors
-        return JSONResponse(status_code=500, content={"error": str(e)})
-
+        raise HTTPException(status_code=500, detail=f"Error reading file: {str(e)}")
